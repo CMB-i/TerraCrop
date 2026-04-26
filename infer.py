@@ -1,18 +1,3 @@
-"""
-infer.py
-========
-Interactive CLI for the full satellite → ground pipeline.
-
-Fixes vs previous version:
-  - Applies the SAME z-score normalisation the training dataset used
-    (computed from the training split, not skipped entirely)
-  - Prints per-class prediction bars + mIoU to console
-  - Saves output_mask.png alongside a pred_bars.png
-
-Usage:
-    python infer.py
-"""
-
 import sys
 import torch
 import torch.nn as nn
@@ -20,15 +5,12 @@ import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import matplotlib.gridspec as gridspec
 from pathlib import Path
 
 from src.terramind import get_model, preprocess
 from src.encode.model import MaskDecoder, MaskEncoder
-from src.dataset import (
-    filter_patches,
-    split_patches,
-    compute_dataset_stats,
-)
+from src.dataset import filter_patches, split_patches, compute_dataset_stats
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -41,12 +23,7 @@ PATCH_GRID = 14
 LABEL_SIZE = 128
 
 CLASS_NAMES = {0: "Background", 1: "Meadow", 2: "Wheat", 3: "Corn"}
-CLASS_COLORS_HEX = {
-    0: "#1a1a2e",
-    1: "#4caf50",
-    2: "#ffc107",
-    3: "#f44336",
-}
+CLASS_COLORS_HEX = {0: "#1a1a2e", 1: "#4caf50", 2: "#ffc107", 3: "#f44336"}
 CLASS_COLORS_RGB = {
     0: (29, 29, 46),
     1: (76, 175, 80),
@@ -114,16 +91,12 @@ class TerraMindSegmenter(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Normalisation — MUST match dataset.py exactly
+# Normalisation — must match dataset.py exactly
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def get_train_stats() -> tuple[np.ndarray, np.ndarray]:
-    """
-    Compute the same per-band mean/std the training dataset used.
-    Uses the same filter + split + seed as train.py / visualize_masks.py.
-    """
-    print("  Computing training normalisation stats (cached after first run)...")
+def get_train_stats():
+    print("  Computing training normalisation stats...")
     filtered = filter_patches(
         data_path=PASTIS_ROOT,
         target_classes=[1, 2, 3],
@@ -131,53 +104,34 @@ def get_train_stats() -> tuple[np.ndarray, np.ndarray]:
         min_pixel_fraction=0.05,
     )
     train_meta, _, _ = split_patches(filtered)
-    mean, std = compute_dataset_stats(PASTIS_ROOT, train_meta, max_patches=100)
-    return mean, std  # (10,) numpy arrays
+    return compute_dataset_stats(PASTIS_ROOT, train_meta, max_patches=100)
 
 
-def normalize_sample(arr: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+def load_pastis_sample(npy_path: Path, mean: np.ndarray, std: np.ndarray):
     """
-    Apply /10000  then z-score with training stats.
-    arr: (C, H, W) float32 after time collapse
+    Returns:
+        normalised: (1, 10, 128, 128) tensor — model input
+        raw_s2:     (10, H, W) float32 array in [0,1] — for display
     """
-    arr = arr / 10000.0  # → [0, 1]
-    arr = (arr - mean[:, None, None]) / (std[:, None, None] + 1e-6)
-    return arr
-
-
-def load_pastis_sample(
-    npy_path: Path, mean: np.ndarray, std: np.ndarray
-) -> torch.Tensor:
-    """
-    Load PASTIS .npy → (1, 10, 128, 128) float32, fully normalised.
-
-    Handles shapes:
-      (T, C, H, W)     → mean over T  → normalise → unsqueeze batch
-      (B, T, C, H, W)  → mean over T  → normalise
-    """
-    arr = np.load(npy_path).astype(np.float32)  # raw DN values
+    arr = np.load(npy_path).astype(np.float32)
     print(f"  Raw array shape: {arr.shape}  max={arr.max():.1f}")
 
-    # Collapse time dimension
     if arr.ndim == 5:  # (B, T, C, H, W)
-        arr = arr.mean(axis=1)  # (B, C, H, W)
+        arr = arr.mean(axis=1)
     elif arr.ndim == 4:  # (T, C, H, W)
-        arr = arr.mean(axis=0)  # (C, H, W)
-        arr = arr[None]  # (1, C, H, W)
+        arr = arr.mean(axis=0)[None]
     elif arr.ndim == 3:  # (C, H, W)
         arr = arr[None]
-    else:
-        print(f"  ✗ Unexpected shape: {arr.shape}")
-        sys.exit(1)
 
     assert arr.shape[1] == 10, f"Expected 10 bands, got {arr.shape[1]}"
 
-    # Apply the SAME normalisation as PASTISCropDataset
-    arr_out = np.stack(
-        [normalize_sample(arr[b], mean, std) for b in range(arr.shape[0])]
-    )
+    # Raw [0,1] copy for display
+    raw_s2 = (arr[0] / 10000.0).clip(0, 1)  # (10, H, W)
 
-    return torch.from_numpy(arr_out)  # (B, 10, 128, 128)
+    # Normalised copy for model
+    norm = arr / 10000.0
+    norm = (norm - mean[None, :, None, None]) / (std[None, :, None, None] + 1e-6)
+    return torch.from_numpy(norm), raw_s2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -192,8 +146,8 @@ def infer_satellite(image, seg_ckpt_path, ae_ckpt_path, device):
     print("  Loading TerraMind segmenter...")
     backbone = get_model(variant="small")
     seg_model = TerraMindSegmenter(backbone).to(device)
-    seg_ckpt = torch.load(seg_ckpt_path, map_location=device)
-    seg_model.load_state_dict(seg_ckpt.get("model_state_dict", seg_ckpt))
+    ckpt = torch.load(seg_ckpt_path, map_location=device)
+    seg_model.load_state_dict(ckpt.get("model_state_dict", ckpt))
     seg_model.eval()
 
     print("  Loading AE encoder...")
@@ -215,10 +169,10 @@ def infer_satellite(image, seg_ckpt_path, ae_ckpt_path, device):
     encoder.eval()
 
     image = image.to(device)
-    logits = seg_model(image)  # (B, 4, 128, 128)
-    mask = logits.argmax(dim=1)  # (B, 128, 128)
-    z = encoder(mask)  # (B, latent_dim)
-    return z, logits, mask
+    logits = seg_model(image)
+    mask = logits.argmax(dim=1)
+    z = encoder(mask)
+    return z, mask
 
 
 @torch.no_grad()
@@ -242,22 +196,18 @@ def infer_earth_systems(z, ae_ckpt_path, device):
         }
     )
     decoder.eval()
-
-    logits = decoder(z.to(device))
-    return logits.argmax(dim=1)
+    return decoder(z.to(device)).argmax(dim=1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# mIoU (foreground only)
+# Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def compute_miou(pred: np.ndarray, gt: np.ndarray) -> float:
-    """pred, gt: (H, W) integer arrays."""
+def compute_miou(pred: np.ndarray, ref: np.ndarray) -> float:
     ious = []
     for cls in range(1, NUM_CLASSES):
-        p = pred == cls
-        l = gt == cls
+        p, l = pred == cls, ref == cls
         inter = (p & l).sum()
         union = (p | l).sum()
         if union > 0:
@@ -265,44 +215,108 @@ def compute_miou(pred: np.ndarray, gt: np.ndarray) -> float:
     return float(np.mean(ious)) if ious else 0.0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Output helpers
-# ─────────────────────────────────────────────────────────────────────────────
+def s2_to_rgb(s2: np.ndarray) -> np.ndarray:
+    """s2: (10, H, W) in [0,1].  Returns (H, W, 3) uint8 NIR-Red-Green composite."""
+    nir, red, green = s2[6], s2[2], s2[1]
+    rgb = np.stack([nir, red, green], axis=-1)
+    lo, hi = np.percentile(rgb, (2, 98))
+    rgb = np.clip((rgb - lo) / (hi - lo + 1e-6), 0, 1)
+    return (rgb * 255).astype(np.uint8)
 
 
-def save_mask_png(mask_np: np.ndarray, out_path: Path):
-    """mask_np: (H, W) int — saves colour-coded PNG."""
-    from PIL import Image
-
-    rgb = np.zeros((*mask_np.shape, 3), dtype=np.uint8)
+def mask_to_rgb(mask: np.ndarray) -> np.ndarray:
+    """mask: (H, W) int.  Returns (H, W, 3) uint8."""
+    rgb = np.zeros((*mask.shape, 3), dtype=np.uint8)
     for cls_id, color in CLASS_COLORS_RGB.items():
-        rgb[mask_np == cls_id] = color
-    Image.fromarray(rgb).save(out_path)
-    print(f"  ✓  Mask PNG → {out_path}")
+        rgb[mask == cls_id] = color
+    return rgb
 
 
-def save_bar_chart(recon_mask: np.ndarray, out_path: Path, miou: float):
+# ─────────────────────────────────────────────────────────────────────────────
+# Combined output figure
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def save_combined(
+    raw_s2: np.ndarray,  # (10, H, W) in [0, 1]
+    recon_mask: np.ndarray,  # (H, W) int
+    seg_mask: np.ndarray,  # (H, W) int  — direct seg, used as reference
+    miou: float,
+    out_path: Path,
+):
     """
-    Single horizontal stacked bar showing the predicted class distribution.
-    Saves next to the mask PNG.
+    Three-panel figure:
+      Left   — S2 false-colour composite (NIR-Red-Green)
+      Centre — reconstructed segmentation mask (colour-coded)
+      Right  — class distribution bar + mIoU
+
+    Dark theme matching visualize_masks.py.
     """
+    BG = "#0d1117"
+
+    fig = plt.figure(figsize=(13, 4.8), facecolor=BG)
+    gs = gridspec.GridSpec(
+        1,
+        3,
+        width_ratios=[1, 1, 1.4],
+        wspace=0.06,
+        left=0.02,
+        right=0.98,
+        top=0.88,
+        bottom=0.14,
+    )
+
+    ax_s2 = fig.add_subplot(gs[0])
+    ax_mask = fig.add_subplot(gs[1])
+    ax_bar = fig.add_subplot(gs[2])
+
+    # ── Panel 1: S2 false-colour ──────────────────────────────────────────
+    ax_s2.imshow(s2_to_rgb(raw_s2), interpolation="nearest")
+    ax_s2.set_title(
+        "S2 false colour\n(NIR · Red · Green)",
+        color="#8b949e",
+        fontsize=9,
+        fontfamily="monospace",
+        pad=6,
+    )
+    ax_s2.set_xticks([])
+    ax_s2.set_yticks([])
+    for sp in ax_s2.spines.values():
+        sp.set_edgecolor("#2d333b")
+        sp.set_linewidth(0.5)
+
+    # ── Panel 2: reconstructed mask ───────────────────────────────────────
+    ax_mask.imshow(mask_to_rgb(recon_mask), interpolation="nearest")
+    ax_mask.set_title(
+        f"Reconstructed mask\nmIoU (AE fidelity) = {miou:.4f}",
+        color="#8b949e",
+        fontsize=9,
+        fontfamily="monospace",
+        pad=6,
+    )
+    ax_mask.set_xticks([])
+    ax_mask.set_yticks([])
+    for sp in ax_mask.spines.values():
+        sp.set_edgecolor("#2d333b")
+        sp.set_linewidth(0.5)
+
+    # ── Panel 3: class distribution bar ───────────────────────────────────
+    ax_bar.set_facecolor(BG)
     total = recon_mask.size
     fracs = [(recon_mask == cls).sum() / total for cls in range(NUM_CLASSES)]
 
-    fig, ax = plt.subplots(figsize=(8, 1.6), facecolor="#0d1117")
-    ax.set_facecolor("#0d1117")
-
+    bar_h, y = 0.45, 0.0
     left = 0.0
     for cls in range(NUM_CLASSES):
         w = fracs[cls]
         if w < 1e-4:
             left += w
             continue
-        ax.barh(0, w, 0.5, left=left, color=CLASS_COLORS_HEX[cls], alpha=0.92)
-        if w > 0.05:
-            ax.text(
+        ax_bar.barh(y, w, bar_h, left=left, color=CLASS_COLORS_HEX[cls], alpha=0.92)
+        if w > 0.06:
+            ax_bar.text(
                 left + w / 2,
-                0,
+                y,
                 f"{w * 100:.1f}%",
                 ha="center",
                 va="center",
@@ -312,48 +326,64 @@ def save_bar_chart(recon_mask: np.ndarray, out_path: Path, miou: float):
             )
         left += w
 
-    ax.set_xlim(0, 1)
-    ax.set_yticks([])
-    ax.set_xlabel("Pixel fraction", fontsize=9, color="#8b949e")
-    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0%}"))
-    ax.tick_params(axis="x", colors="#555555", labelsize=8)
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-    ax.xaxis.grid(True, color="#2d333b", linewidth=0.4, zorder=0)
-
-    ax.set_title(
-        f"Reconstructed mask — class distribution  ·  mIoU = {miou:.4f}",
-        color="white",
-        fontsize=10,
+    ax_bar.set_xlim(0, 1)
+    ax_bar.set_ylim(-0.6, 0.6)
+    ax_bar.set_yticks([])
+    ax_bar.set_xlabel("Pixel fraction", fontsize=9, color="#8b949e", labelpad=6)
+    ax_bar.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0%}"))
+    ax_bar.tick_params(axis="x", colors="#555555", labelsize=8)
+    for sp in ax_bar.spines.values():
+        sp.set_visible(False)
+    ax_bar.xaxis.grid(True, color="#2d333b", linewidth=0.4, zorder=0)
+    ax_bar.set_title(
+        "Class distribution\n(reconstructed mask)",
+        color="#8b949e",
+        fontsize=9,
         fontfamily="monospace",
-        pad=8,
+        pad=6,
     )
 
+    # Legend inside bar panel
     patches = [
         mpatches.Patch(color=CLASS_COLORS_HEX[c], label=CLASS_NAMES[c])
         for c in range(NUM_CLASSES)
     ]
-    ax.legend(
+    ax_bar.legend(
         handles=patches,
-        loc="lower right",
-        ncol=4,
+        loc="lower center",
+        ncol=2,
         fontsize=8,
         facecolor="#161b22",
         edgecolor="#30363d",
         labelcolor="white",
         framealpha=0.9,
+        bbox_to_anchor=(0.5, -0.52),
     )
 
-    plt.tight_layout(pad=1.0)
-    fig.savefig(out_path, dpi=160, bbox_inches="tight", facecolor="#0d1117")
+    # ── Super-title ───────────────────────────────────────────────────────
+    fig.suptitle(
+        "TerraCrop  ·  satellite → compress → reconstruct",
+        color="white",
+        fontsize=11,
+        fontweight="bold",
+        fontfamily="monospace",
+        y=0.97,
+    )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=180, bbox_inches="tight", facecolor=BG)
     plt.close(fig)
-    print(f"  ✓  Bar chart → {out_path}")
+    print(f"  ✓  Output PNG → {out_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Console bar
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def print_bars(recon_mask: np.ndarray, miou: float):
-    """Console class distribution bars + mIoU."""
     total = recon_mask.size
-    print(f"\n  Reconstructed mask  —  mIoU vs GT: {miou:.4f}\n")
+    print(f"\n  Reconstructed mask  —  AE fidelity mIoU: {miou:.4f}\n")
     print(f"  {'Class':<12}  {'Pixels':>8}   {'%':>5}   bar")
     print(f"  {'─' * 12}  {'─' * 8}   {'─' * 5}   {'─' * 40}")
     for cls_id, name in CLASS_NAMES.items():
@@ -403,53 +433,40 @@ def main():
         prompt("TerraMind seg checkpoint (.pt)", default="best_model.pt")
     )
     ae_ckpt = resolve(prompt("AutoEncoder checkpoint (.pt)", default="ae_best_9096.pt"))
-    out_raw = prompt("Output mask (.png)", default="output_mask.png")
+    out_raw = prompt("Output path (.png)", default="output.png")
     out_path = resolve(out_raw, must_exist=False)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     device_str = prompt(
         "Device", default="cuda" if torch.cuda.is_available() else "cpu"
     )
 
-    # ── Normalisation stats (same as training) ────────────────────────────
-    print("\nComputing normalisation stats from training split...")
+    # ── Normalisation ─────────────────────────────────────────────────────
+    print("\nPreparing normalisation stats...")
     mean, std = get_train_stats()
 
-    # ── Load + normalise sample ───────────────────────────────────────────
-    print(f"\nLoading sample: {sample_path}")
-    image = load_pastis_sample(sample_path, mean, std)
-    print(f"  Normalised tensor shape: {tuple(image.shape)}")
+    # ── Load sample ───────────────────────────────────────────────────────
+    print(f"\nLoading: {sample_path}")
+    image, raw_s2 = load_pastis_sample(sample_path, mean, std)
+    print(f"  Model input shape: {tuple(image.shape)}")
 
     # ── Satellite side ────────────────────────────────────────────────────
     print("\n[1/2] Satellite-side  (segment + compress)...")
-    z, seg_logits, seg_mask = infer_satellite(
-        image,
-        str(seg_ckpt),
-        str(ae_ckpt),
-        device_str,
-    )
+    z, seg_mask = infer_satellite(image, str(seg_ckpt), str(ae_ckpt), device_str)
     print(f"  Latent z: {tuple(z.shape)}  ({z.numel() * 4 / 1024:.1f} KB)")
 
     # ── Ground side ───────────────────────────────────────────────────────
     print("\n[2/2] Ground-side  (decompress)...")
     recon_mask = infer_earth_systems(z, str(ae_ckpt), device_str)
 
-    recon_np = recon_mask.squeeze(0).cpu().numpy()  # (128, 128)
-
-    # ── mIoU vs seg mask (no GT label available here) ────────────────────
+    recon_np = recon_mask.squeeze(0).cpu().numpy()
     seg_np = seg_mask.squeeze(0).cpu().numpy()
-    # AE reconstruction vs direct seg
     miou = compute_miou(recon_np, seg_np)
 
     # ── Console output ────────────────────────────────────────────────────
     print_bars(recon_np, miou)
 
-    # ── Save mask PNG ─────────────────────────────────────────────────────
-    print(f"\nSaving outputs...")
-    save_mask_png(recon_np, out_path)
-
-    # ── Save bar chart PNG next to the mask ───────────────────────────────
-    bar_path = out_path.with_stem(out_path.stem + "_bars")
-    save_bar_chart(recon_np, bar_path, miou)
+    # ── Save combined PNG ─────────────────────────────────────────────────
+    print(f"\nSaving → {out_path}")
+    save_combined(raw_s2, recon_np, seg_np, miou, out_path)
 
     print("\n✓  Done.\n")
 
