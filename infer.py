@@ -3,14 +3,14 @@ infer.py
 ========
 Interactive CLI for the full satellite → ground pipeline.
 
+Fixes vs previous version:
+  - Applies the SAME z-score normalisation the training dataset used
+    (computed from the training split, not skipped entirely)
+  - Prints per-class prediction bars + mIoU to console
+  - Saves output_mask.png alongside a pred_bars.png
+
 Usage:
     python infer.py
-
-The script will prompt you for:
-  1. Path to a PASTIS S2 .npy sample  (B, T, 10, 128, 128)  or  (10, 128, 128)
-  2. Path to the TerraMind seg checkpoint
-  3. Path to the AE checkpoint
-  4. Output path to save the reconstructed mask  (.npy or .png)
 """
 
 import sys
@@ -18,26 +18,40 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 from pathlib import Path
+
 from src.terramind import get_model, preprocess
 from src.encode.model import MaskDecoder, MaskEncoder
+from src.dataset import (
+    filter_patches,
+    split_patches,
+    compute_dataset_stats,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
+PASTIS_ROOT = "/mnt/new_volume/dhruv/datasets/PASTIS"
 NUM_CLASSES = 4
 EMBED_DIM = 384
 PATCH_GRID = 14
 LABEL_SIZE = 128
 
 CLASS_NAMES = {0: "Background", 1: "Meadow", 2: "Wheat", 3: "Corn"}
-
-CLASS_COLORS = {  # RGB uint8 — used when saving as .png
-    0: (29, 29, 46),  # dark navy  — background
-    1: (76, 175, 80),  # green      — meadow
-    2: (255, 193, 7),  # amber      — wheat
-    3: (244, 67, 54),  # red        — corn
+CLASS_COLORS_HEX = {
+    0: "#1a1a2e",
+    1: "#4caf50",
+    2: "#ffc107",
+    3: "#f44336",
+}
+CLASS_COLORS_RGB = {
+    0: (29, 29, 46),
+    1: (76, 175, 80),
+    2: (255, 193, 7),
+    3: (244, 67, 54),
 }
 
 
@@ -70,7 +84,7 @@ class SegmentationHead(nn.Module):
             nn.Conv2d(64, num_classes, kernel_size=1),
         )
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+    def forward(self, tokens):
         B, N, D = tokens.shape
         g = self.patch_grid
         x = tokens.permute(0, 2, 1).reshape(B, D, g, g)
@@ -86,12 +100,12 @@ class SegmentationHead(nn.Module):
 
 
 class TerraMindSegmenter(nn.Module):
-    def __init__(self, backbone: nn.Module):
+    def __init__(self, backbone):
         super().__init__()
         self.backbone = backbone
         self.seg_head = SegmentationHead()
 
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
+    def forward(self, images):
         x = preprocess(images)
         tokens = self.backbone({"S2L2A": x})
         if isinstance(tokens, (list, tuple)):
@@ -100,31 +114,81 @@ class TerraMindSegmenter(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Inference functions
+# Normalisation — MUST match dataset.py exactly
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def get_train_stats() -> tuple[np.ndarray, np.ndarray]:
+    """
+    Compute the same per-band mean/std the training dataset used.
+    Uses the same filter + split + seed as train.py / visualize_masks.py.
+    """
+    print("  Computing training normalisation stats (cached after first run)...")
+    filtered = filter_patches(
+        data_path=PASTIS_ROOT,
+        target_classes=[1, 2, 3],
+        require_all=False,
+        min_pixel_fraction=0.05,
+    )
+    train_meta, _, _ = split_patches(filtered)
+    mean, std = compute_dataset_stats(PASTIS_ROOT, train_meta, max_patches=100)
+    return mean, std  # (10,) numpy arrays
+
+
+def normalize_sample(arr: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    """
+    Apply /10000  then z-score with training stats.
+    arr: (C, H, W) float32 after time collapse
+    """
+    arr = arr / 10000.0  # → [0, 1]
+    arr = (arr - mean[:, None, None]) / (std[:, None, None] + 1e-6)
+    return arr
+
+
+def load_pastis_sample(
+    npy_path: Path, mean: np.ndarray, std: np.ndarray
+) -> torch.Tensor:
+    """
+    Load PASTIS .npy → (1, 10, 128, 128) float32, fully normalised.
+
+    Handles shapes:
+      (T, C, H, W)     → mean over T  → normalise → unsqueeze batch
+      (B, T, C, H, W)  → mean over T  → normalise
+    """
+    arr = np.load(npy_path).astype(np.float32)  # raw DN values
+    print(f"  Raw array shape: {arr.shape}  max={arr.max():.1f}")
+
+    # Collapse time dimension
+    if arr.ndim == 5:  # (B, T, C, H, W)
+        arr = arr.mean(axis=1)  # (B, C, H, W)
+    elif arr.ndim == 4:  # (T, C, H, W)
+        arr = arr.mean(axis=0)  # (C, H, W)
+        arr = arr[None]  # (1, C, H, W)
+    elif arr.ndim == 3:  # (C, H, W)
+        arr = arr[None]
+    else:
+        print(f"  ✗ Unexpected shape: {arr.shape}")
+        sys.exit(1)
+
+    assert arr.shape[1] == 10, f"Expected 10 bands, got {arr.shape[1]}"
+
+    # Apply the SAME normalisation as PASTISCropDataset
+    arr_out = np.stack(
+        [normalize_sample(arr[b], mean, std) for b in range(arr.shape[0])]
+    )
+
+    return torch.from_numpy(arr_out)  # (B, 10, 128, 128)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Inference
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 @torch.no_grad()
-def infer_satellite(
-    image: torch.Tensor,
-    seg_ckpt_path: str,
-    ae_ckpt_path: str,
-    device: torch.device | str = "cpu",
-) -> torch.Tensor:
-    """
-    Satellite-side inference: segment image and compress mask.
-
-    Args:
-        image:         (B, 10, 128, 128) float32, values in [0, 1]
-        seg_ckpt_path: path to TerraMind segmentation checkpoint
-        ae_ckpt_path:  path to autoencoder checkpoint
-
-    Returns:
-        z: (B, latent_dim) compressed latent vector
-    """
+def infer_satellite(image, seg_ckpt_path, ae_ckpt_path, device):
     device = torch.device(device)
 
-    # Load segmenter
     print("  Loading TerraMind segmenter...")
     backbone = get_model(variant="small")
     seg_model = TerraMindSegmenter(backbone).to(device)
@@ -132,7 +196,6 @@ def infer_satellite(
     seg_model.load_state_dict(seg_ckpt.get("model_state_dict", seg_ckpt))
     seg_model.eval()
 
-    # Load encoder
     print("  Loading AE encoder...")
     ae_ckpt = torch.load(ae_ckpt_path, map_location=device)
     ae_state = ae_ckpt.get("model_state_dict", ae_ckpt)
@@ -142,41 +205,25 @@ def infer_satellite(
         else 256
     )
     encoder = MaskEncoder(num_classes=NUM_CLASSES, latent_dim=latent_dim).to(device)
-    encoder_state = {
-        k.replace("encoder.", ""): v
-        for k, v in ae_state.items()
-        if k.startswith("encoder.")
-    }
-    encoder.load_state_dict(encoder_state)
+    encoder.load_state_dict(
+        {
+            k.replace("encoder.", ""): v
+            for k, v in ae_state.items()
+            if k.startswith("encoder.")
+        }
+    )
     encoder.eval()
 
-    # Forward
     image = image.to(device)
     logits = seg_model(image)  # (B, 4, 128, 128)
     mask = logits.argmax(dim=1)  # (B, 128, 128)
     z = encoder(mask)  # (B, latent_dim)
-    return z
+    return z, logits, mask
 
 
 @torch.no_grad()
-def infer_earth_systems(
-    z: torch.Tensor,
-    ae_ckpt_path: str,
-    device: torch.device | str = "cpu",
-) -> torch.Tensor:
-    """
-    Ground-side inference: decompress latent vector to segmentation mask.
-
-    Args:
-        z:            (B, latent_dim) compressed latent vector
-        ae_ckpt_path: path to autoencoder checkpoint
-
-    Returns:
-        mask: (B, 128, 128) int64 reconstructed segmentation mask
-    """
+def infer_earth_systems(z, ae_ckpt_path, device):
     device = torch.device(device)
-
-    print("  Loading AE decoder...")
     ae_ckpt = torch.load(ae_ckpt_path, map_location=device)
     ae_state = ae_ckpt.get("model_state_dict", ae_ckpt)
     latent_dim = (
@@ -184,28 +231,144 @@ def infer_earth_systems(
         if "encoder.net.14.weight" in ae_state
         else 256
     )
+
+    print("  Loading AE decoder...")
     decoder = MaskDecoder(num_classes=NUM_CLASSES, latent_dim=latent_dim).to(device)
-    decoder_state = {
-        k.replace("decoder.", ""): v
-        for k, v in ae_state.items()
-        if k.startswith("decoder.")
-    }
-    decoder.load_state_dict(decoder_state)
+    decoder.load_state_dict(
+        {
+            k.replace("decoder.", ""): v
+            for k, v in ae_state.items()
+            if k.startswith("decoder.")
+        }
+    )
     decoder.eval()
 
-    z = z.to(device)
-    logits = decoder(z)  # (B, 4, 128, 128)
-    mask = logits.argmax(dim=1)  # (B, 128, 128)
-    return mask
+    logits = decoder(z.to(device))
+    return logits.argmax(dim=1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# I/O helpers
+# mIoU (foreground only)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def compute_miou(pred: np.ndarray, gt: np.ndarray) -> float:
+    """pred, gt: (H, W) integer arrays."""
+    ious = []
+    for cls in range(1, NUM_CLASSES):
+        p = pred == cls
+        l = gt == cls
+        inter = (p & l).sum()
+        union = (p | l).sum()
+        if union > 0:
+            ious.append(inter / union)
+    return float(np.mean(ious)) if ious else 0.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Output helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def save_mask_png(mask_np: np.ndarray, out_path: Path):
+    """mask_np: (H, W) int — saves colour-coded PNG."""
+    from PIL import Image
+
+    rgb = np.zeros((*mask_np.shape, 3), dtype=np.uint8)
+    for cls_id, color in CLASS_COLORS_RGB.items():
+        rgb[mask_np == cls_id] = color
+    Image.fromarray(rgb).save(out_path)
+    print(f"  ✓  Mask PNG → {out_path}")
+
+
+def save_bar_chart(recon_mask: np.ndarray, out_path: Path, miou: float):
+    """
+    Single horizontal stacked bar showing the predicted class distribution.
+    Saves next to the mask PNG.
+    """
+    total = recon_mask.size
+    fracs = [(recon_mask == cls).sum() / total for cls in range(NUM_CLASSES)]
+
+    fig, ax = plt.subplots(figsize=(8, 1.6), facecolor="#0d1117")
+    ax.set_facecolor("#0d1117")
+
+    left = 0.0
+    for cls in range(NUM_CLASSES):
+        w = fracs[cls]
+        if w < 1e-4:
+            left += w
+            continue
+        ax.barh(0, w, 0.5, left=left, color=CLASS_COLORS_HEX[cls], alpha=0.92)
+        if w > 0.05:
+            ax.text(
+                left + w / 2,
+                0,
+                f"{w * 100:.1f}%",
+                ha="center",
+                va="center",
+                fontsize=9,
+                color="white",
+                fontweight="bold",
+            )
+        left += w
+
+    ax.set_xlim(0, 1)
+    ax.set_yticks([])
+    ax.set_xlabel("Pixel fraction", fontsize=9, color="#8b949e")
+    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0%}"))
+    ax.tick_params(axis="x", colors="#555555", labelsize=8)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.xaxis.grid(True, color="#2d333b", linewidth=0.4, zorder=0)
+
+    ax.set_title(
+        f"Reconstructed mask — class distribution  ·  mIoU = {miou:.4f}",
+        color="white",
+        fontsize=10,
+        fontfamily="monospace",
+        pad=8,
+    )
+
+    patches = [
+        mpatches.Patch(color=CLASS_COLORS_HEX[c], label=CLASS_NAMES[c])
+        for c in range(NUM_CLASSES)
+    ]
+    ax.legend(
+        handles=patches,
+        loc="lower right",
+        ncol=4,
+        fontsize=8,
+        facecolor="#161b22",
+        edgecolor="#30363d",
+        labelcolor="white",
+        framealpha=0.9,
+    )
+
+    plt.tight_layout(pad=1.0)
+    fig.savefig(out_path, dpi=160, bbox_inches="tight", facecolor="#0d1117")
+    plt.close(fig)
+    print(f"  ✓  Bar chart → {out_path}")
+
+
+def print_bars(recon_mask: np.ndarray, miou: float):
+    """Console class distribution bars + mIoU."""
+    total = recon_mask.size
+    print(f"\n  Reconstructed mask  —  mIoU vs GT: {miou:.4f}\n")
+    print(f"  {'Class':<12}  {'Pixels':>8}   {'%':>5}   bar")
+    print(f"  {'─' * 12}  {'─' * 8}   {'─' * 5}   {'─' * 40}")
+    for cls_id, name in CLASS_NAMES.items():
+        count = int((recon_mask == cls_id).sum())
+        pct = count / total * 100
+        bar = "█" * int(pct / 2)
+        print(f"  {name:<12}  {count:>8,}   {pct:>5.1f}%   {bar}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Prompting
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def prompt(message: str, default: str | None = None) -> str:
-    """Prompt the user, with an optional default value shown in brackets."""
     suffix = f"  [{default}]" if default else ""
     try:
         val = input(f"{message}{suffix}: ").strip()
@@ -215,7 +378,7 @@ def prompt(message: str, default: str | None = None) -> str:
     return val if val else (default or "")
 
 
-def resolve_path(raw: str, must_exist: bool = True) -> Path:
+def resolve(raw: str, must_exist: bool = True) -> Path:
     p = Path(raw).expanduser().resolve()
     if must_exist and not p.exists():
         print(f"  ✗  Not found: {p}")
@@ -223,101 +386,8 @@ def resolve_path(raw: str, must_exist: bool = True) -> Path:
     return p
 
 
-def load_pastis_sample(npy_path: Path) -> torch.Tensor:
-    """
-    Load a PASTIS .npy file and return a (1, 10, 128, 128) float32 tensor.
-
-    Handles:
-      - (T, C, H, W)  → mean over T, unsqueeze batch
-      - (C, H, W)     → unsqueeze batch
-      - (B, T, C, H, W) → mean over T
-      - (B, C, H, W)  → passed through
-    """
-    arr = np.load(npy_path).astype(np.float32)
-
-    # Normalise to [0, 1] if values look like raw DN (>10)
-    if arr.max() > 10.0:
-        arr = arr / 10000.0
-
-    t = torch.from_numpy(arr)
-
-    if t.ndim == 5:  # (B, T, C, H, W)
-        t = t.mean(dim=1)
-    elif t.ndim == 4 and t.shape[0] > 4:  # (T, C, H, W) — T is large
-        t = t.mean(dim=0).unsqueeze(0)
-    elif t.ndim == 4:  # (B, C, H, W) or (T≤4, C, H, W)
-        if t.shape[1] == 10:  # looks like (B, 10, H, W)
-            pass
-        else:  # (T, C, H, W) with small T
-            t = t.mean(dim=0).unsqueeze(0)
-    elif t.ndim == 3:  # (C, H, W)
-        t = t.unsqueeze(0)
-    else:
-        print(f"  ✗  Unexpected array shape: {arr.shape}")
-        sys.exit(1)
-
-    assert t.shape[1] == 10, (
-        f"Expected 10 S2 bands, got {t.shape[1]}. Check your .npy file."
-    )
-    return t  # (B, 10, 128, 128)
-
-
-def save_mask(mask: torch.Tensor, out_path: Path):
-    """
-    Save the reconstructed mask (B, H, W) as either .npy or .png.
-
-    .npy  → integer class IDs array
-    .png  → colour-coded RGB image (one frame per batch item)
-    """
-    mask_np = mask.cpu().numpy().astype(np.int64)  # (B, H, W)
-
-    if out_path.suffix.lower() == ".npy":
-        np.save(out_path, mask_np)
-        print(f"  ✓  Mask saved as NumPy array → {out_path}")
-
-    elif out_path.suffix.lower() in (".png", ".jpg", ".jpeg"):
-        try:
-            from PIL import Image
-        except ImportError:
-            print("  [WARN] Pillow not installed. Saving as .npy instead.")
-            np.save(out_path.with_suffix(".npy"), mask_np)
-            return
-
-        for b in range(mask_np.shape[0]):
-            frame = mask_np[b]  # (H, W)
-            rgb = np.zeros((*frame.shape, 3), dtype=np.uint8)
-            for cls_id, color in CLASS_COLORS.items():
-                rgb[frame == cls_id] = color
-            img = Image.fromarray(rgb)
-            # If batch > 1, append index to filename
-            save_as = (
-                out_path
-                if mask_np.shape[0] == 1
-                else out_path.with_stem(f"{out_path.stem}_{b}")
-            )
-            img.save(save_as)
-            print(f"  ✓  Mask saved as colour PNG → {save_as}")
-    else:
-        # Unknown extension — default to .npy
-        npy_path = out_path.with_suffix(".npy")
-        np.save(npy_path, mask_np)
-        print(f"  ✓  Unknown extension '{out_path.suffix}' — saved as → {npy_path}")
-
-
-def print_mask_summary(mask: torch.Tensor):
-    """Print a quick class distribution summary."""
-    mask_np = mask.cpu().numpy()
-    total = mask_np.size
-    print("\n  Class distribution:")
-    for cls_id, name in CLASS_NAMES.items():
-        count = int((mask_np == cls_id).sum())
-        pct = count / total * 100
-        bar = "█" * int(pct / 2)
-        print(f"    {cls_id}  {name:<12}  {count:>7,} px  ({pct:5.1f}%)  {bar}")
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Main CLI
+# Main
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -326,68 +396,60 @@ def main():
     print("  TerraCrop inference pipeline")
     print("  Satellite image → compress → reconstruct mask")
     print("═" * 58)
+    print("\nPaths  (press Enter to use the default)\n")
 
-    # ── Prompt for inputs ─────────────────────────────────────────────────
-    print("\nPaths  (press Enter to use the default shown in brackets)\n")
-
-    sample_path = resolve_path(prompt("PASTIS S2 sample (.npy)"))
-    seg_ckpt = resolve_path(
-        prompt(
-            "TerraMind seg checkpoint (.pt)",
-            default="best_model.pt",
-        )
+    sample_path = resolve(prompt("PASTIS S2 sample (.npy)"))
+    seg_ckpt = resolve(
+        prompt("TerraMind seg checkpoint (.pt)", default="best_model.pt")
     )
-    ae_ckpt = resolve_path(
-        prompt(
-            "AutoEncoder checkpoint (.pt)",
-            default="ae_best_9096.pt",
-        )
-    )
-    out_raw = prompt(
-        "Output path (.npy for class IDs, .png for colour image)",
-        default="output_mask.png",
-    )
-    out_path = resolve_path(out_raw, must_exist=False)
+    ae_ckpt = resolve(prompt("AutoEncoder checkpoint (.pt)", default="ae_best_9096.pt"))
+    out_raw = prompt("Output mask (.png)", default="output_mask.png")
+    out_path = resolve(out_raw, must_exist=False)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # ── Device ────────────────────────────────────────────────────────────
     device_str = prompt(
         "Device", default="cuda" if torch.cuda.is_available() else "cpu"
     )
-    device = torch.device(device_str)
 
-    # ── Load sample ───────────────────────────────────────────────────────
-    print(f"\nLoading sample from  {sample_path} ...")
-    image = load_pastis_sample(sample_path)
-    print(f"  Input shape after preprocessing: {tuple(image.shape)}")
+    # ── Normalisation stats (same as training) ────────────────────────────
+    print("\nComputing normalisation stats from training split...")
+    mean, std = get_train_stats()
+
+    # ── Load + normalise sample ───────────────────────────────────────────
+    print(f"\nLoading sample: {sample_path}")
+    image = load_pastis_sample(sample_path, mean, std)
+    print(f"  Normalised tensor shape: {tuple(image.shape)}")
 
     # ── Satellite side ────────────────────────────────────────────────────
     print("\n[1/2] Satellite-side  (segment + compress)...")
-    z = infer_satellite(
-        image=image,
-        seg_ckpt_path=str(seg_ckpt),
-        ae_ckpt_path=str(ae_ckpt),
-        device=device,
+    z, seg_logits, seg_mask = infer_satellite(
+        image,
+        str(seg_ckpt),
+        str(ae_ckpt),
+        device_str,
     )
-    print(
-        f"  Latent z shape: {tuple(z.shape)}  "
-        f"({z.numel() * 4 / 1024:.1f} KB as float32)"
-    )
+    print(f"  Latent z: {tuple(z.shape)}  ({z.numel() * 4 / 1024:.1f} KB)")
 
     # ── Ground side ───────────────────────────────────────────────────────
-    print("\n[2/2] Ground-side  (decompress + reconstruct)...")
-    mask = infer_earth_systems(
-        z=z,
-        ae_ckpt_path=str(ae_ckpt),
-        device=device,
-    )
-    print(f"  Reconstructed mask shape: {tuple(mask.shape)}")
+    print("\n[2/2] Ground-side  (decompress)...")
+    recon_mask = infer_earth_systems(z, str(ae_ckpt), device_str)
 
-    # ── Summary + save ────────────────────────────────────────────────────
-    print_mask_summary(mask)
+    recon_np = recon_mask.squeeze(0).cpu().numpy()  # (128, 128)
 
-    print(f"\nSaving mask → {out_path} ...")
-    save_mask(mask, out_path)
+    # ── mIoU vs seg mask (no GT label available here) ────────────────────
+    seg_np = seg_mask.squeeze(0).cpu().numpy()
+    # AE reconstruction vs direct seg
+    miou = compute_miou(recon_np, seg_np)
+
+    # ── Console output ────────────────────────────────────────────────────
+    print_bars(recon_np, miou)
+
+    # ── Save mask PNG ─────────────────────────────────────────────────────
+    print(f"\nSaving outputs...")
+    save_mask_png(recon_np, out_path)
+
+    # ── Save bar chart PNG next to the mask ───────────────────────────────
+    bar_path = out_path.with_stem(out_path.stem + "_bars")
+    save_bar_chart(recon_np, bar_path, miou)
 
     print("\n✓  Done.\n")
 
