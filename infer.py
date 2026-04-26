@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from pathlib import Path
-from terramind import get_model, preprocess
-from encode.model import MaskDecoder, MaskEncoder
+from src.terramind import get_model, preprocess
+from src.encode.model import MaskDecoder, MaskEncoder
 
 NUM_CLASSES = 4
 EMBED_DIM = 384

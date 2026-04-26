@@ -1,3 +1,9 @@
+"""
+Download the dataset using:
+    wget https://zenodo.org/record/5012942/files/PASTIS.zip
+"""
+
+
 import os
 import torch
 import torch.nn as nn
@@ -8,18 +14,18 @@ from torch.utils.data import DataLoader
 from pathlib import Path
 from tqdm import tqdm
 
-from terramind import get_model, preprocess
+from src.terramind import get_model, preprocess
 from dataset import (
     PASTISCropDataset,
     compute_dataset_stats,
     filter_patches,
     split_patches,
 )
-from utils import SegmentationMetrics, validate
+from src.utils import SegmentationMetrics, validate
 
 # Config
 BACKBONE_VARIANT = "small"
-PASTIS_ROOT = "/mnt/new_volume/dhruv/datasets/PASTIS"
+PASTIS_ROOT = "/mnt/new_volume/dhruv/datasets/PASTIS"  # change if req
 TARGET_CLASSES = [1, 2, 3]  # Meadow=1, Wheat=2, Corn=3
 NUM_CLASSES = 4
 EMBED_DIM = 384
