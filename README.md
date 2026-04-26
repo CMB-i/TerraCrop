@@ -73,7 +73,7 @@ We evaluated mIoU over foreground crop classes only: Meadow, Wheat, and Corn. Ba
 **Model footprint**
 - Segmentation: **116 MB**
 - Autoencoder: **51 MB**
-- Total: **167 MB (~43.8M params)**
+- Total: **167 MB (~36,185,992 params)**
 
 **Inference + memory**
 - Batch size: 1
