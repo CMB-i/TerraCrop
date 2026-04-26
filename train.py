@@ -15,7 +15,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from src.terramind import get_model, preprocess
-from dataset import (
+from src.dataset import (
     PASTISCropDataset,
     compute_dataset_stats,
     filter_patches,
