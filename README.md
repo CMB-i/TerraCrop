@@ -3,6 +3,7 @@
 Sentinel-2 → crop mask → 1.5 KB downlink  
 Built for satellites that can't afford to send home every pixel.
 
+Built for the 418 hackathon by team SEUT. This is a standalone copy of my team's submission
 ---
 
 ## 1. What problem are you solving?
@@ -171,7 +172,13 @@ submissions/SEUT/
 
 ## Team: SEUT (Satellite Edge Uplink Technology)
 
-- Dhruv Nandigam — model training / evaluation / integration / everything :)
-- Charvi Mahalakshmi Bayana — autoencoder compression pipeline / frontend / demo
-- Meet Sangani - ideation / visualization / presentation / writeup
+Original submission: 
+github.com/Dristro/TerraCrop/tree/main/submissions/SEUT
 
+- Dhruv Nandigam — model training, evaluation, integration
+- Charvi Mahalakshmi Bayana — autoencoder compression pipeline, frontend/demo, 
+  and accuracy-improvement research during training
+- Meet Sangani — ideation, visualization, presentation
+
+This repo (CMB-i/TerraCrop) is maintained by Charvi as a standalone copy of the SEUT 
+submission for portfolio purposes.
