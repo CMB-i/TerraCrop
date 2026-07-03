@@ -153,7 +153,7 @@ python src/encode/train.py
 ## Repo contents
 
 ```text
-submissions/SEUT/
+TerraCrop
 ├── README.md
 ├── infer.py                  # CLI entry point for satellite → ground pipeline
 ├── train.py                  # TerraMind segmentation fine-tuning
